@@ -2294,4 +2294,16 @@ TEST_F(RdbTest, SnapshotEgressThrottle) {
   EXPECT_GT(t_lim, t_base * 3);
 }
 
+// The output buffer lets mutation fibers queue inline-serialized chunks for the flush fiber
+// instead of waiting on the sink. Roundtrip a save and reload with it off, on, and off again
+// (the flag is runtime-mutable and read when a snapshot starts).
+TEST_F(RdbTest, SnapshotOutputBuffer) {
+  Run({"debug", "populate", "20000", "key", "1000"});
+  for (string_view limit : {"0", "1mb", "0"}) {
+    ASSERT_EQ(Run({"config", "set", "snapshot_output_buffer_limit", limit}), "OK");
+    ASSERT_EQ(Run({"debug", "reload"}), "OK");
+    EXPECT_THAT(Run({"dbsize"}), IntArg(20000));
+  }
+}
+
 }  // namespace dfly

@@ -85,8 +85,9 @@ flowchart TD
   PS --> FS[FlushSerialized]
   FS --> HFD
 
-  HFD --> SEQ["seq_cond_.wait - ordering gate"]
-  SEQ --> CD["consumer_->ConsumeData"]
+  HFD --> PQ["pending_ (FIFO queue,<br/>snapshot_output_buffer_limit)"]
+  PQ --> FFB["flush_fb_"]
+  FFB --> CD["consumer_->ConsumeData"]
   CD --> SINK[(Replica socket / file sink)]
 ```
 
@@ -424,17 +425,40 @@ is the only surviving role of the `eventually_consistent_` flag.
 
 ## Flushing and Backpressure
 
-### `HandleFlushData(std::string data)` — Common Blocking Sink
+### `HandleFlushData(std::string data)` — Common Sink
 
 All serialized data ultimately flows through `HandleFlushData` (`snapshot.cc`):
 
 1. If `stream_mu_.is_locked()`, increments `stats_.flushed_under_lock` (observability).
-2. Assigns a monotonically increasing record ID (`rec_id_++`).
-3. Optionally yields (background mode).
-4. **Blocks** on `seq_cond_.wait` until `id == last_pushed_id_ + 1` (sequential ordering gate).
-5. **Blocks** on `consumer_->ConsumeData(data, base_cntx_)` (downstream write).
-6. Updates `last_pushed_id_`, notifies waiters via `seq_cond_.notify_all()`.
-7. In non-background mode, sleeps up to 2ms proportional to CPU spent, to throttle.
+2. Optionally yields (background mode).
+3. Records the chunk against the egress throttler.
+4. Appends the chunk to `pending_` and wakes `flush_fb_`. Appending never preempts, so the
+   queue order is the production order across fibers.
+5. **Blocks** on `drain_cv_`:
+   - the traversal fiber at a safe point (`FlushSerialized`, between entries) waits for its own
+     chunk to be written, which paces the traversal at the sink's rate as before;
+   - every other call waits only while `pending_bytes_` exceeds `snapshot_output_buffer_limit`.
+     This covers mutation fibers, and any fiber flushing mid-value through
+     `ConsumeBigValueChunk`, which holds a bucket dependency at that point: a dependency must
+     never be kept across a sink write, or a mutation of that bucket blocks its shard's
+     transaction queue for as long as the queue takes to drain.
+   The default limit of `0` makes every producer wait for the queue to drain.
+6. In non-background mode, sleeps up to 2ms proportional to CPU spent, to throttle.
+
+Once `StopFlushFb` has joined the flush fiber (journal mode tail, see below), the call writes
+to the consumer directly.
+
+### `FlushPendingFb()` — Flush Fiber
+
+Started by `Start`, one per `SliceSnapshot`. Pops `pending_` in FIFO order and **blocks** on
+`consumer_->ConsumeData(data, base_cntx_)` (socket or file write) for each chunk, then
+subtracts the chunk from `pending_bytes_` and notifies `drain_cv_`. `ConsumeData` returns at
+once when the context stopped running, so cancellation drains the queue without writing.
+
+`StopFlushFb` sets `stop_flush_`, waits for the queue to drain and joins the fiber. The
+snapshot fiber calls it before `consumer_->Finalize()` for saves; for replication, where journal
+entries keep flowing after the traversal, `FinalizeJournalStream` calls it after the last
+`PushSerialized(true)`, so the stable-sync streamer never races the full-sync tail on the socket.
 
 ### `ConsumeBigValueChunk(std::string data)`
 
@@ -505,12 +529,12 @@ A non-preempting latch guarding the `change_cb_` consumer list. Held during `Cal
 `FlushChangeToEarlierCallbacks`, and `WaitForUnblockedJournalWrites` so the consumer set cannot
 change underneath an iteration.
 
-### `seq_cond_` (CondVarAny)
+### `flush_cv_` / `drain_cv_` (CondVarAny)
 
-Condition variable in `HandleFlushData` ensuring records reach the consumer in `rec_id_` order. If
-fiber A has `id=5` and fiber B `id=6`, B waits until A pushes and advances `last_pushed_id_` to 5.
-Needed because fibers wake in arbitrary order and reordering flushed chunks would corrupt the wire
-protocol.
+`flush_cv_` wakes `flush_fb_` when `pending_` gains a chunk or `stop_flush_` is set. `drain_cv_`
+wakes producers blocked in `HandleFlushData` whenever the flush fiber completes a write. Ordering
+comes from the FIFO itself: chunks reach the consumer in the order they were appended, so fibers
+waking in arbitrary order cannot reorder them on the wire.
 
 ## Code Paths That Reach `HandleFlushData`
 
@@ -539,7 +563,7 @@ flowchart TD
     FS --> HFD2[HandleFlushData]
   end
 
-  HFD1 --> BLOCK["seq_cond_.wait → consumer_->ConsumeData (BLOCKING)"]
+  HFD1 --> BLOCK["pending_ → flush_fb_ → consumer_->ConsumeData (BLOCKING)"]
   HFD2 --> BLOCK
 
   classDef perentry fill:#FFF3E0,stroke:#EF6C00;
@@ -589,8 +613,8 @@ The following items remain open:
      consumer backpressure; the bandwidth limiter is an additional upper bound.
    - **Account post-compression bytes** (what actually hits the wire), measured where the chunk is
      handed to `ConsumeData`.
-   - Interaction with background mode and with the `seq_cond_` ordering gate (the sleep must not be
-     held while blocking other producers behind the ordering gate).
+   - Interaction with background mode and with the flush fiber (the sleep must not be held while
+     other producers wait on `drain_cv_`).
 
 4. **Broaden journal-omit eligibility.** `is_omittable_operation` is currently set only for
    self-contained single-key writes (e.g. `SET`). Extending "skip both" to a wider, individually

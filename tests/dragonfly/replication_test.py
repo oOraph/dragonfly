@@ -232,6 +232,35 @@ async def test_replication_list_double_apply(df_factory: DflyInstanceFactory):
     await assert_replica_data_matches(c_master, [c_replica])
 
 
+@pytest.mark.parametrize("output_buffer", ["0", "64mb"])
+async def test_replication_full_sync_output_buffer(df_factory: DflyInstanceFactory, output_buffer):
+    """Mutations streamed during full sync replicate correctly with and without the snapshot
+    output buffer, which lets mutation fibers queue their inline-serialized chunks for the
+    flush fiber instead of waiting on the replica socket."""
+    master, [replica], c_master, [c_replica] = await setup_replication(
+        df_factory,
+        master_args={"proactor_threads": 2, "snapshot_output_buffer_limit": output_buffer},
+        replica_args={"proactor_threads": 1},
+        connect=False,
+    )
+
+    seeder = SeederV2(key_target=5000, data_size=1000, huge_value_size=70000, huge_value_target=10)
+    await seeder.run(c_master, target_deviation=0.01)
+
+    stream_task = asyncio.create_task(seeder.run(c_master))
+    await asyncio.sleep(0.0)
+
+    await c_replica.execute_command("REPLICAOF localhost " + str(master.port))
+
+    async with async_timeout.timeout(120):
+        await wait_for_replicas_state(c_replica)
+
+    await seeder.stop(c_master)
+    await stream_task
+
+    await assert_replica_data_matches(c_master, [c_replica])
+
+
 """
 Test flushall command. Set data to master send flashall and set more data.
 Check replica keys at the end.
