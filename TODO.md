@@ -1,18 +1,44 @@
-1. To move lua_project to dragonfly from helio (DONE)
-2. To limit lua stack to something reasonable like 4096.
-3. To inject our own allocator to lua to track its memory.
+# TODO before submitting upstream
 
+Review notes on this PR (oOraph/dragonfly#2, fixing oOraph/dragonfly#1). Delete this file before
+opening the upstream PR.
 
-## Object lifecycle and thread-safety.
+No correctness bug found: FIFO ordering holds (appending never preempts, so OnChange baseline still
+precedes its journal entry in the same blob), the full-sync cut and the EOF token go out only after
+the queue drains, and every path that starts `flush_fb_` stops it.
 
-Currently our transactional and locking model is based on an assumption that any READ or WRITE
-access to objects must be performed in a shard where they belong.
+## Resolved (2026-10-28)
 
-However, this assumption can be relaxed to get significant gains for read-only queries.
+1. **Default `0` semantics.** Egress is now recorded by the flush fiber just before the write, as
+   the producers did. The post-flush sleep stays traversal-only on purpose and the commit message
+   says so (a mutation fiber's sleep lands on every command queued behind it).
+2. **Memory bound.** Flag help, docs and commit message now say: per shard *and per running
+   snapshot*, soft by one chunk per blocked producer. Verified in `EngineShard::UsedMemory`: the
+   queued strings live on the thread's default mimalloc heap, not the data heap, so they count
+   toward RSS and `snapshot_serialization_bytes` but not `used_memory`.
+3. **Direct-write branch after `StopFlushFb`.** Unreachable: `UnregisterOnChange` waits on
+   `change_cb_latch_` (held across `OnChange`) and the journal's `UnregisterOnChange` takes
+   `cb_mu_` (held across `CallOnChange`), so no producer is in flight when the fiber is joined.
+   Now `LOG(DFATAL)` with the direct write as the release fallback.
+4. **Tests.** `RdbTest.SnapshotOutputBuffer` saves while another fiber overwrites not yet
+   traversed keys. `test_replication_full_sync_output_buffer_replica_stalls` (`0` / `1mb`) pauses
+   the replica mid sync, asserts `snapshot_serialization_bytes` above the limit, lets
+   `replication_timeout` drop the replica, checks writers release and the queue drains, then
+   resumes the replica and compares the data.
+5. `pending_bytes_` counts string capacity.
+6. Flush fiber priority: one comment at the fiber creation (NORMAL even in background mode).
+7. Commit message now cites the PR body's numbers (production 16384 x 1.5 MB, synthetic repro).
 
-### Explanation
-Our transactional framework prevents from READ-locked objects to be mutated. It does not prevent from their PrimaryTable to grow or change, of course. These objects can move to different entries inside the table. However, our CompactObject maintains the following property - its reference CompactObject.AsRef() is valid no matter where the master object moves and it's valid and safe for reading even from other threads. The exception regarding thread safety is SmallString which uses translation table for its pointers.
+## Remaining
 
-If we change the SmallString translation table to be global and thread-safe (it should not have lots of write contention anyway) we may access primetable keys and values from another thread and write them directly to sockets.
+8. PR body links `oOraph/dragonfly#1`; upstream it must say `Fixes dragonflydb/dragonfly#<new>`.
 
-Use-case: large strings that need to be copied. Sets that need to be serialized for SMEMBERS/HGETALL commands etc. Additional complexity - we will need to lock those variables even for single hop transactions and unlock them afterwards. The unlocking hop does not need to increase user-visible latency since it can be done after we send reply to the socket.
+## Upstream plan
+
+1. Create the upstream issue from oOraph/dragonfly#1's text.
+   - Decide whether the repro's member names (`org%d/repo%d/...`) and the "cache index"
+     description are fine to publish as is.
+2. Update commit message and PR body to link the new issue; delete this file; push
+   `HEAD:refs/heads/full-sync-async-push` to `origin`.
+3. Open a **draft** PR on `dragonflydb/dragonfly` from `oOraph:full-sync-async-push`.
+   - Upstream may ask to sign the CLA (`CLA.txt`).
