@@ -982,7 +982,7 @@ TEST_F(RdbTest, FailedLoadDropsUnbuiltIndex) {
 
   const auto no_index = ErrArg("idx: no such index");
   EXPECT_THAT(Run({"ft._list"}).GetVec(), IsEmpty());
-  EXPECT_THAT(Run({"FT.TAGVALS", "idx", "g"}), ErrArg("Index with name 'idx' not found"));
+  EXPECT_THAT(Run({"FT.TAGVALS", "idx", "g"}), no_index);
   EXPECT_THAT(Run({"FT.SEARCH", "idx", "hello"}), no_index);
   EXPECT_THAT(Run({"FT.AGGREGATE", "idx", "*"}), RespArray(ElementsAre(IntArg(0))));
   EXPECT_THAT(
@@ -2063,6 +2063,37 @@ TEST_F(RdbTest, AliasJournalMutationsAbortFullSync) {
   expect_rejected_without_mutation("FT.ALIASUPDATE", "live", "idx-b", true);
   expect_rejected_without_mutation("FT.ALIASDEL", "live", "", true);
 }
+
+// A full sync replays a journaled FT.SYNUPDATE before the index from the header is built.
+TEST_F(RdbTest, FullSyncKeepsSynUpdateOnUnbuiltIndex) {
+  ASSERT_THAT(Run({"HSET", "doc:1", "t", "automobile"}), IntArg(1));
+
+  string body;
+  body.push_back(RDB_OPCODE_AUX);
+  AddKV(&body, "search-index", "idx ON HASH PREFIX 1 doc: SCHEMA t TEXT");
+
+  io::StringSink sink;
+  JournalWriter writer(&sink);
+  const string_view args[] = {"idx", "g1", "car", "automobile"};
+  writer.Write(journal::Entry{1, journal::Op::COMMAND, 0, std::nullopt,
+                              journal::Entry::Payload("FT.SYNUPDATE", ArgSlice{args})});
+  RdbSerializer serializer(CompressionMode::NONE);
+  ASSERT_FALSE(serializer.WriteJournalEntry(std::move(sink).str()));
+  body += serializer.Flush(RdbSerializer::FlushState::kFlushEndEntry);
+
+  const auto rdb = WrapInRdb(body);
+  pp_->at(0)->Await([&] { service_->RequestLoadingState(); });
+  EXPECT_FALSE(LoadRdbBytes(to_byte(rdb.data()), rdb.size()));
+  pp_->at(0)->Await([&] {
+    RdbLoadContext{}.PerformPostLoad(service_.get());
+    service_->RemoveLoadingState();
+  });
+
+  EXPECT_THAT(Run({"FT.SYNDUMP", "idx"}),
+              RespArray(UnorderedElementsAre("car", RespElementsAre("g1"), "automobile",
+                                             RespElementsAre("g1"))));
+  EXPECT_THAT(Run({"FT.SEARCH", "idx", "car", "NOCONTENT"}), RespElementsAre(IntArg(1), "doc:1"));
+}
 #endif
 
 TEST_F(RdbTest, HashExpiryEncoding) {
@@ -2869,6 +2900,35 @@ TEST_F(RdbTest, SnapshotEgressThrottle) {
 
   // Sanity: the slowdown is caused by the limit, not by inherent save cost.
   EXPECT_GT(t_lim, t_base * 3);
+}
+
+// The output buffer lets mutation fibers queue inline-serialized chunks for the flush fiber
+// instead of waiting on the sink. Save while another fiber overwrites keys the traversal has not
+// reached yet, with the buffer off, on, and off again (the flag is runtime-mutable and read when
+// a snapshot starts), and check the file loads back whole.
+TEST_F(RdbTest, SnapshotOutputBuffer) {
+  Run({"debug", "populate", "20000", "key", "1000"});
+  for (string_view limit : {"0", "1mb", "0"}) {
+    ASSERT_EQ(Run({"config", "set", "snapshot_output_buffer_limit", limit}), "OK");
+
+    auto save_fb = pp_->at(0)->LaunchFiber([&] { ASSERT_EQ(Run({"save", "rdb"}), "OK"); });
+    do {
+      usleep(10);
+    } while (!service_->server_family().TEST_IsSaving());
+
+    // Every write to a bucket not yet traversed serializes that bucket inline and queues it.
+    pp_->at(1)->Await([&] {
+      for (unsigned i = 0; i < 20000; i += 7) {
+        Run({"set", StrCat("key:", i), "updated"});
+      }
+    });
+    save_fb.Join();
+
+    auto save_info = service_->server_family().GetLastSaveInfo();
+    ASSERT_EQ(Run({"flushall"}), "OK");
+    ASSERT_EQ(Run({"dfly", "load", save_info.file_name}), "OK");
+    EXPECT_THAT(Run({"dbsize"}), IntArg(20000));
+  }
 }
 
 TEST_F(RdbTest, EofWithRemoteShardChunksPending) {

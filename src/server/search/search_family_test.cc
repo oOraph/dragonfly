@@ -27,6 +27,7 @@
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/search/doc_index.h"
+#include "server/search/global_hnsw_index.h"
 #include "server/test_utils.h"
 
 using namespace testing;
@@ -429,7 +430,7 @@ TEST_F(SearchFamilyTest, CreateDropListIndex) {
   EXPECT_THAT(Run({"ft.create", "idx-1", "ON", "HASH", "SCHEMA", "f", "TEXT"}),
               ErrArg("Index already exists"));
 
-  EXPECT_THAT(Run({"ft.dropindex", "idx-100"}), ErrArg("Index with name 'idx-100' not found"));
+  EXPECT_THAT(Run({"ft.dropindex", "idx-100"}), ErrArg("idx-100: no such index"));
 
   EXPECT_EQ(Run({"ft.dropindex", "idx-1"}), "OK");
   EXPECT_THAT(Run({"ft._list"}), RespElementsAre("idx-3"));
@@ -495,17 +496,59 @@ TEST_F(SearchFamilyTest, DropIndexRemovesIndexAndAlias) {
   EXPECT_THAT(Run({"FT.ALIASDEL", "live"}), ErrArg("Alias does not exist"));
 }
 
-TEST_F(SearchFamilyTest, AlterPreservesAlias) {
+TEST_F(SearchFamilyTest, DropIndexResolvesAlias) {
+  for (bool delete_docs : {false, true}) {
+    ASSERT_THAT(Run({"HSET", "d:1", "title", "hello"}), IntArg(delete_docs ? 0 : 1));
+    ASSERT_EQ(
+        Run({"FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "d:", "SCHEMA", "title", "TEXT"}),
+        "OK");
+    WaitForIndexReady("idx");
+    ASSERT_EQ(Run({"FT.ALIASADD", "live", "idx"}), "OK");
+    ASSERT_EQ(Run({"FT.ALIASADD", "other", "idx"}), "OK");
+
+    ASSERT_EQ(delete_docs ? Run({"FT.DROPINDEX", "live", "DD"}) : Run({"FT.DROPINDEX", "live"}),
+              "OK");
+    EXPECT_THAT(Run({"FT.INFO", "idx"}), ErrArg("idx: no such index"));
+    EXPECT_THAT(Run({"FT.ALIASDEL", "live"}), ErrArg("Alias does not exist"));
+    EXPECT_THAT(Run({"FT.ALIASDEL", "other"}), ErrArg("Alias does not exist"));
+    EXPECT_THAT(Run({"EXISTS", "d:1"}), IntArg(delete_docs ? 0 : 1));
+    EXPECT_THAT(Run({"FT.DROPINDEX", "live"}), ErrArg("live: no such index"));
+  }
+}
+
+TEST_F(SearchFamilyTest, AlterResolvesAndPreservesAlias) {
   ASSERT_THAT(Run({"HSET", "d:1", "color", "red"}), IntArg(1));
   ASSERT_EQ(Run({"FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "d:", "SCHEMA", "title", "TEXT"}),
             "OK");
   WaitForIndexReady("idx");
   ASSERT_EQ(Run({"FT.ALIASADD", "live", "idx"}), "OK");
 
-  ASSERT_EQ(Run({"FT.ALTER", "idx", "SCHEMA", "ADD", "color", "TAG"}), "OK");
+  ASSERT_EQ(Run({"FT.ALTER", "live", "SCHEMA", "ADD", "color", "TAG"}), "OK");
   WaitForIndexReady("idx");
   EXPECT_EQ(map_string("index_name", Run({"FT.INFO", "live"}).GetVec()), "idx");
   EXPECT_THAT(Run({"FT.SEARCH", "live", "@color:{red}"}), AreDocIds("d:1"));
+}
+
+TEST_F(SearchFamilyTest, AlterAndDropAliasWithHnsw) {
+  ASSERT_EQ(Run({"FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "h:", "SCHEMA", "title", "TEXT"}),
+            "OK");
+  WaitForIndexReady("idx");
+  ASSERT_EQ(Run({"FT.ALIASADD", "live", "idx"}), "OK");
+  ASSERT_THAT(Run({"HSET", "h:1", "vec", FloatVec1(1)}), IntArg(1));
+  ASSERT_EQ(Run("FT.ALTER live SCHEMA ADD vec VECTOR HNSW 6 TYPE FLOAT32 DIM 1 "
+                "DISTANCE_METRIC L2"),
+            "OK");
+  WaitForIndexReady("idx");
+  EXPECT_THAT(Run({"FT.SEARCH", "idx", "*=>[KNN 1 @vec $q]", "PARAMS", "2", "q", FloatVec1(1),
+                   "NOCONTENT"}),
+              IsArray(IntArg(1), "h:1"));
+
+  ASSERT_EQ(Run({"FT.DROPINDEX", "live"}), "OK");
+
+  // Reusing the canonical name and vector field requires the old registry entry to be removed.
+  EXPECT_EQ(Run("FT.CREATE idx ON HASH SCHEMA vec VECTOR HNSW 6 TYPE FLOAT32 DIM 1 "
+                "DISTANCE_METRIC L2"),
+            "OK");
 }
 
 TEST_F(SearchFamilyTest, TagValsResolvesAlias) {
@@ -522,7 +565,7 @@ TEST_F(SearchFamilyTest, TagValsResolvesAlias) {
   ASSERT_EQ(Run({"FT.ALIASUPDATE", "live", "b:"}), "OK");
   EXPECT_THAT(Run({"FT.TAGVALS", "live", "color"}), IsUnordArray("blue"));
   ASSERT_EQ(Run({"FT.ALIASDEL", "live"}), "OK");
-  EXPECT_THAT(Run({"FT.TAGVALS", "live", "color"}), ErrArg("Index with name 'live' not found"));
+  EXPECT_THAT(Run({"FT.TAGVALS", "live", "color"}), ErrArg("live: no such index"));
 }
 
 TEST_F(SearchFamilyTest, AliasNameResolutionWithoutIndex) {
@@ -541,6 +584,31 @@ TEST_F(SearchFamilyTest, AliasNameResolutionWithoutIndex) {
     EXPECT_EQ(indices->ResolveIndexName("live"), "idx");
     EXPECT_EQ(indices->ResolveIndexName("missing"), "missing");
   });
+}
+
+TEST_F(SearchFamilyTest, HnswSearchMissingShardIndex) {
+  CreateHnswHashIdx();
+  ASSERT_THAT(Run({"HSET", "h:1", "title", "hello", "vec", FloatVec1(1)}), IntArg(2));
+  WaitForIndexReady("idx");
+  const string query_vec = FloatVec1(1);
+  ASSERT_THAT(Run({"FT.SEARCH", "idx", "*=>[KNN 1 @vec $v]", "PARAMS", "2", "v", query_vec}),
+              AreDocIds("h:1"));
+
+  // Reproduce DROPINDEX's intermediate state: local indices are gone, but the global graph remains.
+  shard_set->RunBlockingInParallel([](EngineShard* shard) {
+    auto index = shard->search_indices()->DropIndex("idx");
+    ASSERT_NE(index, nullptr);
+  });
+  ASSERT_TRUE(GlobalHnswIndexRegistry::Instance().Exist("idx", "vec"));
+
+  for (string_view expr : {"*=>[KNN 1 @vec $v]", "@vec:[VECTOR_RANGE 0.5 $v]"}) {
+    EXPECT_THAT(Run({"FT.SEARCH", "idx", expr, "PARAMS", "2", "v", query_vec}),
+                ErrArg("idx: no such index"));
+    EXPECT_THAT(Run({"FT.PROFILE", "idx", "SEARCH", "QUERY", expr, "PARAMS", "2", "v", query_vec}),
+                ErrArg("idx: no such index"));
+    EXPECT_THAT(Run({"FT.AGGREGATE", "idx", expr, "PARAMS", "2", "v", query_vec}),
+                ErrArg("idx: no such index"));
+  }
 }
 
 TEST_F(SearchFamilyTest, HnswAliasConcludesTransactions) {
@@ -744,7 +812,7 @@ TEST_F(SearchFamilyTest, AlterIndex) {
   EXPECT_THAT(Run({"ft.search", "idx-1", "@cost:[100 300]"}), AreDocIds("d:1", "d:2"));
 
   EXPECT_THAT(Run({"ft.alter", "idx-2", "schema", "add", "price", "numeric"}),
-              ErrArg("Index not found"));
+              ErrArg("idx-2: no such index"));
 }
 
 TEST_F(SearchFamilyTest, SuffixPrefixSearch) {
@@ -1378,7 +1446,7 @@ TEST_F(SearchFamilyTest, Tags) {
   EXPECT_EQ(Run({"ft.create", "i1", "on", "hash", "schema", "color", "tag", "dummy", "numeric"}),
             "OK");
   WaitForIndexReady("i1");
-  EXPECT_THAT(Run({"ft.tagvals", "i2", "color"}), ErrArg("Index with name 'i2' not found"));
+  EXPECT_THAT(Run({"ft.tagvals", "i2", "color"}), ErrArg("i2: no such index"));
   EXPECT_THAT(Run({"ft.tagvals", "i1", "foo"}), ErrArg("No such field"));
   EXPECT_THAT(Run({"ft.tagvals", "i1", "dummy"}), ErrArg("Not a tag field"));
   auto resp = Run({"ft.tagvals", "i1", "color"});
@@ -4027,6 +4095,8 @@ TEST_F(SearchFamilyTest, SynonymCommandsResolveAliases) {
   EXPECT_THAT(Run({"FT.SYNDUMP", "live"}),
               IsUnordArray("cat", IsArray("animals"), "feline", IsArray("animals")));
   EXPECT_THAT(Run({"FT.SEARCH", "idx", "feline"}), AreDocIds("doc:1"));
+  ASSERT_EQ(Run({"FT.ALIASDEL", "live"}), "OK");
+  EXPECT_THAT(Run({"FT.SYNDUMP", "live"}), ErrArg("live: no such index"));
 }
 
 TEST_F(SearchFamilyTest, SynonymsSearch) {
@@ -4480,6 +4550,28 @@ TEST_F(SearchFamilyTest, FieldExpirySynUpdateDropsExpiredTerm) {
   EXPECT_EQ(Run({"FT.SYNUPDATE", "idx", "g", "hello", "hi"}), "OK");
   EXPECT_THAT(Run({"FT.SEARCH", "idx", "hello", "NOCONTENT"}), kNoResults);
   EXPECT_THAT(Run({"FT.SEARCH", "idx", "hi", "NOCONTENT"}), kNoResults);
+}
+
+// The kept values release their memory once the documents are gone.
+TEST_F(SearchFamilyTest, FieldExpiryValuesReleaseMemory) {
+  EXPECT_EQ(Run({"FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "d:", "SCHEMA", "title", "TEXT",
+                 "NOSTEM"}),
+            "OK");
+  auto add_and_delete = [&](bool with_ttl) {
+    constexpr int kNumDocs = 500;
+    for (int i = 0; i < kNumDocs; i++) {
+      if (with_ttl)
+        Run({"HSETEX", absl::StrCat("d:", i), "100", "title", "hello"});
+      else
+        Run({"HSET", absl::StrCat("d:", i), "title", "hello"});
+    }
+    for (int i = 0; i < kNumDocs; i++)
+      Run({"DEL", absl::StrCat("d:", i)});
+    return GetMetrics().search_stats.used_memory;
+  };
+
+  size_t without_ttl = add_and_delete(false);
+  EXPECT_EQ(add_and_delete(true), without_ttl);
 }
 
 TEST_F(SearchFamilyTest, FtAlterKeepsSynonyms) {
