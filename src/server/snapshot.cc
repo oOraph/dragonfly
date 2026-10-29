@@ -57,6 +57,11 @@ thread_local absl::flat_hash_set<SliceSnapshot*> tl_slice_snapshots;
 // it may require (especially with compression), and less responsive the server may be.
 constexpr size_t kMinBlobSize = 8_KB;
 
+// ~15usec of CPU: the slice a producer runs before it yields to the other fibers of its thread.
+uint64_t CyclesPerJiffy() {
+  return base::CycleClock::Frequency() >> 16;
+}
+
 }  // namespace
 
 SliceSnapshot::SliceSnapshot(CompressionMode compression_mode, DbSlice* slice,
@@ -186,8 +191,6 @@ void SliceSnapshot::FinalizeJournalStream(bool cancel) {
 
 // Serializes all the entries with version less than snapshot_version_.
 void SliceSnapshot::IterateBucketsFb(bool send_full_sync_cut) {
-  const uint64_t kCyclesPerJiffy = base::CycleClock::Frequency() >> 16;  // ~15usec.
-
   // Covers cancellation exits; on the normal path the entries were already drained.
   absl::Cleanup discard_delayed = [this] { DiscardDelayedEntries(); };
 
@@ -227,7 +230,7 @@ void SliceSnapshot::IterateBucketsFb(bool send_full_sync_cut) {
         PushSerialized(false);
       } else {
         if (!PushSerialized(false)) {
-          if (!use_background_mode_ && ThisFiber::GetRunningTimeCycles() > kCyclesPerJiffy) {
+          if (!use_background_mode_ && ThisFiber::GetRunningTimeCycles() > CyclesPerJiffy()) {
             ThisFiber::Yield();
           }
         }
@@ -350,14 +353,23 @@ void SliceSnapshot::HandleFlushData(std::string data, bool safe_point) {
     });
   }
 
-  if (traversal && !use_background_mode_) {
-    // serializer_->Flush can be quite slow for large values or due to compression, therefore
-    // we counter-balance CPU over-usage by sleeping. Only the traversal paces itself this way:
-    // a mutation fiber holds its shard's transaction queue, so each sleep lands on every queued
-    // command, 240 times for a 15 MB value chunked at 64 KB.
-    // We measure running_cycles before the preemption points, because they reset the counter.
-    uint64_t sleep_usec = (running_cycles * 1000'000 / base::CycleClock::Frequency()) / 2;
-    ThisFiber::SleepFor(chrono::microseconds(std::min<uint64_t>(sleep_usec, 2000ul)));
+  if (traversal) {
+    if (!use_background_mode_) {
+      // serializer_->Flush can be quite slow for large values or due to compression, therefore
+      // we counter-balance CPU over-usage by sleeping. Only the traversal paces itself this way:
+      // a mutation fiber holds its shard's transaction queue, so each sleep lands on every queued
+      // command, 240 times for a 15 MB value chunked at 64 KB.
+      // We measure running_cycles before the preemption points, because they reset the counter.
+      uint64_t sleep_usec = (running_cycles * 1000'000 / base::CycleClock::Frequency()) / 2;
+      ThisFiber::SleepFor(chrono::microseconds(std::min<uint64_t>(sleep_usec, 2000ul)));
+    }
+  } else if (ThisFiber::GetRunningTimeCycles() > CyclesPerJiffy()) {
+    // With room in the queue the wait above returns at once, so a producer serializing a large
+    // value would hand over every chunk in one CPU slice and keep the flush fiber, the other
+    // connections and the timers of this thread waiting. Yield once the slice is used up, as the
+    // sink write did on every chunk before the queue existed. A wait that preempted reset the
+    // counter, so this does not add to it.
+    ThisFiber::Yield();
   }
 
   VLOG(2) << "Pushed with Serialize() " << serialized;
